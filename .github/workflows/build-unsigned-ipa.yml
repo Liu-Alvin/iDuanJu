@@ -55,12 +55,12 @@ jobs:
           build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Info.plist")
           executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
           /usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms' "$app/Info.plist" | grep -q iPhoneOS
-          xcrun lipo -verify_arch arm64 "$app/$executable"
           stage=$(mktemp -d)
           mkdir -p "$stage/Payload"
           ditto "$app" "$stage/Payload/STV.app"
           ipa="$PWD/dist/STV-${version}-${build}-unsigned.ipa"
           (cd "$stage" && zip -qry "$ipa" Payload)
+          xcrun lipo "$app/$executable" -verify_arch arm64
           unzip -t "$ipa"
           shasum -a 256 "$ipa" > "$ipa.sha256"
           git rev-parse HEAD > dist/source-commit.txt
