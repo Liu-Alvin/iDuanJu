@@ -19,6 +19,22 @@ i短剧 是一个原生 SwiftUI 编写的 iOS 多源短剧 / 视频 / 漫画 / T
   预缓冲、本地 HLS 代理、CENC 解密、Telegram 视频边下边播（TDLib Range 流式）
 - **Cloudflare 验证**：隐藏 WebView 自动过验证（每个插件独立）
 
+## 截图
+
+> 模拟器截图，内容均为红果公开短剧及演示插件。
+
+| 首页 | 频道切换 | 搜索 | 详情 |
+|:---:|:---:|:---:|:---:|
+| <img src="docs/screenshots/01-home.jpg" width="200"> | <img src="docs/screenshots/02-channels.jpg" width="200"> | <img src="docs/screenshots/03-search.jpg" width="200"> | <img src="docs/screenshots/04-detail.jpg" width="200"> |
+| **竖屏播放** | **选集** | **弹幕** | **插件管理** |
+| <img src="docs/screenshots/05-player.jpg" width="200"> | <img src="docs/screenshots/06-episodes.jpg" width="200"> | <img src="docs/screenshots/07-danmaku.jpg" width="200"> | <img src="docs/screenshots/08-plugins.jpg" width="200"> |
+| **插件详情与权限** | | | |
+| <img src="docs/screenshots/09-plugin-detail.jpg" width="200"> | | | |
+
+**横屏播放**
+
+<img src="docs/screenshots/10-landscape.jpg" width="820">
+
 ## 编译
 
 要求：macOS + Xcode 16 或更新、[XcodeGen](https://github.com/yonaskolb/XcodeGen)，最低支持 **iOS 17.0**
