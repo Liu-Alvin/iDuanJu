@@ -42,6 +42,7 @@ jobs:
             -derivedDataPath DerivedDataRelease \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            SWIFT_COMPILATION_MODE=incremental \
             CODE_SIGN_IDENTITY='' \
             build 2>&1 | tee dist/build.log
 
