@@ -1,0 +1,78 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Prepare XcodeGen
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+          xcodegen generate
+
+      - name: Build for iPhone without signing
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          xcodebuild \
+            -project STV.xcodeproj \
+            -scheme STV \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath DerivedDataRelease \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            build 2>&1 | tee dist/build.log
+
+      - name: Package and verify IPA
+        run: |
+          set -euo pipefail
+          app="$PWD/DerivedDataRelease/Build/Products/Release-iphoneos/STV.app"
+          test -d "$app"
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist")
+          build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Info.plist")
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms' "$app/Info.plist" | grep -q iPhoneOS
+          xcrun lipo -verify_arch arm64 "$app/$executable"
+          stage=$(mktemp -d)
+          mkdir -p "$stage/Payload"
+          ditto "$app" "$stage/Payload/STV.app"
+          ipa="$PWD/dist/STV-${version}-${build}-unsigned.ipa"
+          (cd "$stage" && zip -qry "$ipa" Payload)
+          unzip -t "$ipa"
+          shasum -a 256 "$ipa" > "$ipa.sha256"
+          git rev-parse HEAD > dist/source-commit.txt
+          {
+            echo "Built unsigned iPhone IPA: STV-${version}-${build}-unsigned.ipa"
+            echo 'Download the unsigned-ipa artifact below and extract it before signing.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA and build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 7
