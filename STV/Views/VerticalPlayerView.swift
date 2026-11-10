@@ -93,7 +93,7 @@ struct PlayerScreen: View {
                 ZStack(alignment: .topLeading) {
                     Color.black
                     // A single in-window layer remains the PiP source across paging, rotation and buffering.
-                    PlayerLayerView(coordinator: co, fill: fillScreen)
+                    PlayerLayerView(coordinator: co, fill: fillScreen, engine: co.engineKind)
                         .frame(width: area.width, height: area.height).offset(x: area.minX, y: area.minY)
                         .allowsHitTesting(false)
                     Group {
@@ -106,6 +106,18 @@ struct PlayerScreen: View {
                         }
                     }
                     .frame(width: full.width, height: full.height)
+                    if let sub = co.subtitleText, !co.pipActive {
+                        // Aether loopback / software routes: the host draws the selected track's cues.
+                        VStack {
+                            Spacer()
+                            Text(sub).font(.system(size: landscape ? 18 : 16, weight: .semibold)).foregroundStyle(.white)
+                                .multilineTextAlignment(.center).shadow(color: .black, radius: 2).shadow(color: .black.opacity(0.8), radius: 4)
+                                .padding(.horizontal, 24)
+                                .padding(.bottom, (landscape ? 70 : 200) + ins.bottom)
+                                .accessibilityIdentifier("player.subtitle")
+                        }
+                        .frame(width: full.width, height: full.height).allowsHitTesting(false)
+                    }
                     if series.source == .hongguo, danmaku.enabled, !co.pipActive, !speedMode,
                        let i = co.current, co.readyIndex == i, co.episodes.indices.contains(i) {
                         danmakuLayer(i, full: full, ins: ins)
@@ -424,7 +436,7 @@ struct PlayerScreen: View {
             Button { fillScreen.toggle(); showOSD(fillScreen ? "画面：铺满全屏" : "画面：完整自适应") } label: {
                 Label(fillScreen ? "完整自适应" : "铺满全屏", systemImage: fillScreen ? "rectangle.compress.vertical" : "rectangle.expand.vertical")
             }
-            Button { muted.toggle(); co.player.isMuted = muted; showOSD(muted ? "已静音" : "已取消静音") } label: {
+            Button { muted.toggle(); co.setMuted(muted); showOSD(muted ? "已静音" : "已取消静音") } label: {
                 Label(muted ? "取消静音" : "静音", systemImage: muted ? "speaker.wave.2" : "speaker.slash")
             }
             if series.source == .hongguo {
@@ -582,7 +594,7 @@ struct PlayerScreen: View {
         let i = co.current ?? 0
         switch p {
         case .rates:
-            SpeedPopover(current: co.playbackRate, landscape: landscape) { r in co.lockRate(r); closePanel() }
+            SpeedPopover(current: co.playbackRate, landscape: landscape, maxRate: co.engine.maxRate) { r in co.lockRate(r); closePanel() }
         case .quality:
             ScrollView {
                 QualityPopover(streams: co.streams[i] ?? [], chosen: co.chosen[i], sources: sourceRows,
@@ -592,10 +604,10 @@ struct PlayerScreen: View {
             }.scrollIndicators(.hidden)
         case .audio:
             TrackPopover(title: "音轨", options: co.audioOptions, selected: co.audioSelected, allowsOff: false,
-                         emptyText: "当前视频只有一条音轨") { o in co.selectMedia(o, audible: true); closePanel() }
+                         emptyText: "当前视频只有一条音轨") { o in if let o { co.selectAudio(o) }; closePanel() }
         case .subtitles:
             TrackPopover(title: "字幕", options: co.subtitleOptions, selected: co.subtitleSelected, allowsOff: true,
-                         emptyText: "当前视频没有可选字幕") { o in co.selectMedia(o, audible: false); closePanel() }
+                         emptyText: "当前视频没有可选字幕") { o in co.selectSubtitle(o); closePanel() }
         case .episodes:
             EpisodesPopover(episodes: co.episodes, current: co.current ?? 0,
                             seasons: seasonChips,
@@ -709,7 +721,8 @@ struct PlayerScreen: View {
             let offset = Int((dx / stepPts).rounded(.towardZero))
             if offset != lastStepOffset {
                 lastStepOffset = offset
-                let idx = max(0, min(PlaybackCoordinator.rateSteps.count - 1, speedBaseIndex + offset))
+                let top = PlaybackCoordinator.rateSteps.lastIndex { $0 <= co.engine.maxRate + 0.001 } ?? PlaybackCoordinator.rateSteps.count - 1
+                let idx = max(0, min(top, speedBaseIndex + offset))
                 let next = PlaybackCoordinator.rateSteps[idx]
                 if next != previewRate {
                     previewRate = next
@@ -849,34 +862,31 @@ struct PosterBackdrop: View {
     }
 }
 
+/// Hosts the active core's video surface (AetherPlayerView or an AVPlayerLayer view); swapped when an
+/// episode falls back from AetherEngine to AVPlayer.
 struct PlayerLayerView: UIViewRepresentable {
     let coordinator: PlaybackCoordinator
     var fill: Bool = false
+    var engine: PlayerEngineKind = .aether
 
-    final class V: UIView {
-        override class var layerClass: AnyClass { AVPlayerLayer.self }
-        var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
-        weak var playback: PlaybackCoordinator?
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            if window != nil { playback?.attachPlayerLayer(playerLayer) }
-        }
-    }
-
-    func makeUIView(context: Context) -> V {
-        let view = V()
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
         view.backgroundColor = .black
         view.isUserInteractionEnabled = false
-        view.playerLayer.videoGravity = fill ? .resizeAspectFill : .resizeAspect
-        view.playerLayer.player = coordinator.player
-        view.playback = coordinator
+        mount(in: view)
         return view
     }
 
-    func updateUIView(_ view: V, context: Context) {
-        let g: AVLayerVideoGravity = fill ? .resizeAspectFill : .resizeAspect
-        if view.playerLayer.videoGravity != g { view.playerLayer.videoGravity = g }
+    func updateUIView(_ view: UIView, context: Context) { mount(in: view) }
+
+    private func mount(in container: UIView) {
+        coordinator.fill = fill
+        let surface = coordinator.engine.surface
+        guard surface.superview !== container else { return }
+        container.subviews.forEach { $0.removeFromSuperview() }
+        surface.frame = container.bounds
+        surface.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        container.addSubview(surface)
     }
 }
 

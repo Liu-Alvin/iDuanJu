@@ -40,15 +40,35 @@ Pornhub (mediaDefinitions) were cross-checked against its extractors. The Swift 
   host CSS selector API; independent implementations.
 - 苹果 CMS v10 采集接口 (`?ac=list|detail`) adapter: independent implementation of the public API format.
 
+## AetherEngine — LGPL-3.0 with App Store / DRM Exception (player core, 1.5 build 2+)
+- https://github.com/superuser404notfound/AetherEngine — **tag 7.62.0** (commit a1d2cab8281cbf06f5f459b05dad4653ad12559f),
+  SwiftPM product `AetherEngine`, statically linked, **unmodified**. Copyright (C) 2026 Vincent Herbst.
+- Distributed under the license's App Store / DRM exception (end-user re-linking of the app binary is waived by that
+  exception); the corresponding source is the 7.62.0 tag above. Full text: `STV/Resources/Licenses/AetherEngine-LICENSE.txt`
+  (bundled, shown in 开源许可).
+- Only the `AetherEngine` product is linked; SMBClient appears in Package.resolved but is not linked (no symbols).
+
+## FFmpeg (via FFmpegBuild 3.14.0) — LGPL-2.1-or-later, dynamically linked
+- https://github.com/superuser404notfound/FFmpegBuild — tag 3.14.0 (commit 2ff2238f6b65d7686e71c8aa9e45fa4e26f33e1d);
+  build script, configure flags and local FFmpeg / libzvbi patches are in that tag's `build.sh` and `patches/`.
+- FFmpeg built without `--enable-gpl` / `--enable-version3`. Shipped as dynamic frameworks in `STV.app/Frameworks/`
+  (`AetherLibavcodec`, `AetherLibavformat`, `AetherLibavutil`, `AetherLibswresample`, `AetherLibswscale`, `AetherLibavfilter`),
+  never merged into the app binary, so they can be replaced/relinked.
+- libzvbi (`AetherLibzvbi`): LGPL-2.0-or-later conveyed under LGPL-2.1, `ure.c` MIT; GPL-2 files removed by build.sh.
+- Texts: `STV/Resources/Licenses/FFmpeg-LGPL-2.1.txt`, `libzvbi-ure-MIT.txt`.
+
+## dav1d — BSD-2-Clause (`AetherLibdav1d`), zimg — WTFPL (`AetherLibzimg`)
+- Unmodified upstream sources built by FFmpegBuild 3.14.0. Texts: `dav1d-BSD-2-Clause.txt`, `zimg-WTFPL.txt`.
+
+## libdovi (dovi_tool `dolby_vision` crate, via LibDovi 2.2.0) — MIT
+- https://github.com/quietvoid/dovi_tool — Copyright (c) quietvoid and contributors (MIT OR Apache-2.0, used under MIT).
+- Packaged by https://github.com/superuser404notfound/LibDovi tag 2.2.0 (static). Text: `LibDovi-LICENSE.txt`.
+
 ## Reverse-engineered protocol data (Hongguo / 红果)
 - `STV/Providers/Hongguo/*` and `STV/Resources/medusa_tables.bin` implement the Hongguo app's request signing
   (X-Gorgon / X-Argus / X-Medusa) and device registration from interoperability analysis. No third-party source code is
   included. No device identifiers, accounts or keys are bundled: every install registers / mints its own anonymous device.
 
-## Planned: AetherEngine — LGPL-3.0 (with App Store exception)
-- https://github.com/superuser404notfound/aetherengine — planned playback backend (not yet in this snapshot).
-  LGPL-3.0 is compatible with this project's GPL-3.0; its notice and license text will be added when it is integrated.
-
 ## License compatibility
-All components above (Apache-2.0, MIT, BSL-1.0, Unlicense, LGPL-3.0) are compatible with distributing the whole
-work under **GPL-3.0-or-later**. This project itself is licensed under GPL-3.0 (see `LICENSE`).
+All components above (Apache-2.0, MIT, BSD-2-Clause, WTFPL, BSL-1.0, Unlicense, LGPL-2.1/LGPL-3.0 with exception) are
+compatible with distributing the whole work under GPL-3.0. This project itself is licensed under **GPL-3.0** (see `LICENSE`).

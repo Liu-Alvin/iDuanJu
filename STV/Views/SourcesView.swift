@@ -7,6 +7,8 @@ struct SourcesView: View {
     @State private var message: String?
     @State private var bufferMB = BufferSettings.megabytes
     @State private var cacheBytes: Int64 = 0
+    @State private var adStrip = HLSAdFilter.enabled
+    @State private var engineKind = PlayerEngineSettings.preferred
 
     var body: some View {
         ScrollView {
@@ -46,6 +48,17 @@ struct SourcesView: View {
                             .accessibilityIdentifier("settings.prebuffer")
                             .onChange(of: bufferMB) { _, v in BufferSettings.megabytes = v }
                         }.padding(14)
+                        Toggle(isOn: Binding(get: { adStrip }, set: { adStrip = $0; HLSAdFilter.enabled = $0 })) {
+                            label("去广告", "nosign", sub: "去掉 HLS 片源里插播的广告片段（adjump、异域名短片段、AES 片源中的明文短片段、重复片段）；不会整段丢弃正片的分段标记")
+                        }.padding(14).accessibilityIdentifier("settings.adstrip")
+                        VStack(alignment: .leading, spacing: 10) {
+                            label("播放内核", "cpu", sub: "AetherEngine（FFmpeg 解封装，支持 MKV/FLV/AVI 等与真实音轨/字幕列表）；遇到 CENC/FairPlay 或加载失败自动回退系统播放器")
+                            Picker("播放内核", selection: Binding(get: { engineKind }, set: { engineKind = $0; PlayerEngineSettings.preferred = $0 })) {
+                                ForEach(PlayerEngineKind.allCases, id: \.self) { Text($0.label).tag($0) }
+                            }
+                            .pickerStyle(.segmented)
+                            .accessibilityIdentifier("settings.engine")
+                        }.padding(14)
                         actionRow("清空预缓冲缓存（\(ByteCountFormatter.string(fromByteCount: cacheBytes, countStyle: .file))，上限 2GB）", "externaldrive.badge.xmark") {
                             PrefetchStore.shared.clearAll()
                             cacheBytes = PrefetchStore.shared.totalBytes()
@@ -71,6 +84,7 @@ struct SourcesView: View {
                 }
             }.padding(.vertical, 12)
         }
+        .defaultScrollAnchor(DebugScroll.anchor)
         .background(STVTheme.bg.ignoresSafeArea())
         .navigationTitle("片源管理")
         .navigationBarTitleDisplayMode(.inline)
@@ -148,6 +162,59 @@ struct SourcesView: View {
     }
 }
 
+/// AetherEngine (LGPL-3.0 + App Store exception, statically linked) and the libraries it brings:
+/// FFmpeg/libzvbi (LGPL, dynamic AetherLib*.framework), dav1d, zimg, libdovi.
+struct PlayerCoreLicenses: View {
+    @State private var open: String?
+    private struct Item: Identifiable {
+        let id: String; let title: String; let license: String; let links: [(String, String)]; let note: String; let files: [String]
+    }
+    private let items: [Item] = [
+        Item(id: "aether", title: "AetherEngine 7.62.0", license: "LGPL-3.0 + App Store / DRM Exception · Copyright © 2026 Vincent Herbst",
+             links: [("源码（7.62.0 标签）", "https://github.com/superuser404notfound/AetherEngine/tree/7.62.0")],
+             note: "播放内核，静态链接，未修改。依据其 App Store / DRM 例外条款分发；对应源码见上方 7.62.0 标签。",
+             files: ["AetherEngine-LICENSE"]),
+        Item(id: "ffmpeg", title: "FFmpeg（via FFmpegBuild 3.14.0）", license: "LGPL-2.1-or-later（未启用 GPL / version3）",
+             links: [("FFmpegBuild 3.14.0 源码与构建脚本", "https://github.com/superuser404notfound/FFmpegBuild/tree/3.14.0"),
+                     ("ffmpeg.org", "https://ffmpeg.org")],
+             note: "以动态框架形式（Frameworks/AetherLib*.framework）随应用分发，可替换重链接；FFmpegBuild 的本地补丁与 libzvbi 修改见其 build.sh。libzvbi 库源码为 LGPL-2.0-or-later（按 LGPL-2.1 分发），ure.c 为 MIT。",
+             files: ["FFmpeg-LGPL-2.1", "libzvbi-ure-MIT"]),
+        Item(id: "dav1d", title: "dav1d", license: "BSD-2-Clause · Copyright © VideoLAN and dav1d authors",
+             links: [("code.videolan.org/videolan/dav1d", "https://code.videolan.org/videolan/dav1d")], note: "AV1 解码（AetherLibdav1d）。", files: ["dav1d-BSD-2-Clause"]),
+        Item(id: "zimg", title: "zimg", license: "WTFPL",
+             links: [("github.com/sekrit-twc/zimg", "https://github.com/sekrit-twc/zimg")], note: "缩放 / 色彩转换（AetherLibzimg）。", files: ["zimg-WTFPL"]),
+        Item(id: "dovi", title: "libdovi（dovi_tool dolby_vision crate，via LibDovi 2.2.0）", license: "MIT · Copyright (c) quietvoid and contributors",
+             links: [("github.com/quietvoid/dovi_tool", "https://github.com/quietvoid/dovi_tool"), ("LibDovi 2.2.0", "https://github.com/superuser404notfound/LibDovi/tree/2.2.0")],
+             note: "Dolby Vision RPU 解析（静态库，MIT 选项）。", files: ["LibDovi-LICENSE"]),
+    ]
+    private func text(_ f: String) -> String {
+        Bundle.main.url(forResource: f, withExtension: "txt").flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? f
+    }
+    var body: some View {
+        ForEach(items) { it in
+            VStack(alignment: .leading, spacing: 8) {
+                Text(it.title).font(.headline).foregroundStyle(STVTheme.text)
+                Text(it.license).font(.subheadline).foregroundStyle(STVTheme.secondary)
+                ForEach(it.links, id: \.1) { l in
+                    Link(l.0, destination: URL(string: l.1)!).font(.subheadline).tint(STVTheme.accent)
+                }
+                Text(it.note).font(.caption).foregroundStyle(STVTheme.secondary)
+                Button(open == it.id ? "收起许可证全文" : "查看许可证全文") { withAnimation { open = open == it.id ? nil : it.id } }
+                    .font(.subheadline.weight(.semibold)).tint(STVTheme.accent)
+                    .accessibilityIdentifier("licenses.\(it.id)")
+                if open == it.id {
+                    ForEach(it.files, id: \.self) { f in
+                        Text(text(f)).font(.system(.caption2, design: .monospaced)).foregroundStyle(STVTheme.secondary).textSelection(.enabled)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(14)
+            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14))
+        }
+    }
+}
+
 /// 开源许可 — third-party code this app ports.
 struct LicensesView: View {
     @State private var expanded = false
@@ -209,6 +276,7 @@ struct LicensesView: View {
                 }
                 .padding(14)
                 .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14))
+                PlayerCoreLicenses()
                 VStack(alignment: .leading, spacing: 8) {
                     Text("JMComic-Crawler-Python").font(.headline).foregroundStyle(STVTheme.text)
                     Text("MIT License · Copyright © hect0x7").font(.subheadline).foregroundStyle(STVTheme.secondary)
@@ -225,6 +293,7 @@ struct LicensesView: View {
                 .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14))
             }.padding(16)
         }
+        .defaultScrollAnchor(DebugScroll.anchor)
         .background(STVTheme.bg.ignoresSafeArea())
         .navigationTitle("开源许可")
         .navigationBarTitleDisplayMode(.inline)

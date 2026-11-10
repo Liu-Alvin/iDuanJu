@@ -12,6 +12,30 @@ struct PlayerTech: Equatable {
     var audio = ""           // "AAC 2.0"
     var bitrate: Double = 0  // Mbps (indicated / estimated)
     var network: Double = 0  // bytes per second observed (0 = unknown / local file)
+    var engine = ""          // "Aether" / "AVPlayer"
+
+    static func channelLabel(_ channels: Int) -> String {
+        channels >= 8 ? "7.1" : channels >= 6 ? "5.1" : channels == 1 ? "1.0" : channels > 0 ? "2.0" : ""
+    }
+
+    /// Audio label from an FFmpeg codec name ("aac", "eac3", "opus").
+    static func audioName(codec: String, channels: Int) -> String {
+        let n: String
+        switch codec.lowercased() {
+        case "aac": n = "AAC"
+        case "ac3": n = "AC3"
+        case "eac3": n = "E-AC3"
+        case "mp3", "mp3float": n = "MP3"
+        case "opus": n = "Opus"
+        case "flac": n = "FLAC"
+        case "truehd": n = "TrueHD"
+        case "dts", "dca": n = "DTS"
+        case "": return ""
+        default: n = codec.uppercased()
+        }
+        let ch = channelLabel(channels)
+        return ch.isEmpty ? n : "\(n) \(ch)"
+    }
 
     static func resolutionLabel(_ size: CGSize) -> String {
         let s = Int(min(size.width, size.height).rounded())

@@ -15,6 +15,9 @@ i短剧 是一个原生 SwiftUI 编写的 iOS 多源短剧 / 视频 / 漫画 / T
 - **JS 插件系统**：基于 QuickJS 的沙箱，每个插件独立运行、只能访问自己声明且你同意过的域名，cookie / 存储互相隔离，
   不能 `eval`、访问不到本机和内网。支持从网址 / 文件 / 粘贴添加，以及订阅列表。规范见 [`docs/plugins/SPEC_ZH.md`](docs/plugins/SPEC_ZH.md)
 - **苹果 CMS v10 采集站**通用适配（m3u8 / mp4 直链）
+- **播放内核**：默认 [AetherEngine](https://github.com/superuser404notfound/AetherEngine)（FFmpeg 解封装 + 系统硬解，支持 MKV/FLV/AVI、真实音轨 / 字幕列表、HDR / 杜比视界），
+  遇到 CENC / FairPlay 或加载失败时自动回退系统 AVPlayer；可在设置里手动切换
+- **去广告**：自动剔除 HLS 片源中插播的广告片段（adjump、异域名短片段、AES 片源里的明文短片段等），默认开启，可在设置里关闭
 - **播放器**：自绘控制层、竖屏默认 / 旋转或手动横屏、亮度音量手势、倍速、画质 / 线路切换、选集、弹幕、跳过片头、
   预缓冲、本地 HLS 代理、CENC 解密、Telegram 视频边下边播（TDLib Range 流式）
 - **Cloudflare 验证**：隐藏 WebView 自动过验证（每个插件独立）
@@ -35,10 +38,15 @@ i短剧 是一个原生 SwiftUI 编写的 iOS 多源短剧 / 视频 / 漫画 / T
 
 <img src="docs/screenshots/10-landscape.jpg" width="820">
 
+**AetherEngine 播放内核（1.5 build 2）**
+
+| 音轨 | 画质 / 播放源 | 倍速（最高 2×） | 去广告 / 播放内核设置 | 开源许可 |
+|:---:|:---:|:---:|:---:|:---:|
+| <img src="docs/screenshots/11-audio-tracks.jpg" width="160"> | <img src="docs/screenshots/12-quality-source.jpg" width="160"> | <img src="docs/screenshots/13-speed.jpg" width="160"> | <img src="docs/screenshots/14-settings-adstrip-engine.jpg" width="160"> | <img src="docs/screenshots/15-licenses.jpg" width="160"> |
+
 ## 编译
 
-要求：macOS + Xcode 16 或更新、[XcodeGen](https://github.com/yonaskolb/XcodeGen)，最低支持 **iOS 17.0**
-（之后切换到 AetherEngine 播放内核时会升到 iOS 18）。
+要求：macOS + Xcode 16 或更新、[XcodeGen](https://github.com/yonaskolb/XcodeGen)，最低支持 **iOS 18.0**（AetherEngine 的要求）。
 
 ```bash
 brew install xcodegen
@@ -49,7 +57,20 @@ xcodebuild -project STV.xcodeproj -scheme STV -sdk iphonesimulator \
   -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 ```
 
-依赖会由 Swift Package Manager 自动拉取：TDLibKit（含预编译 TDLib，首次拉取较大）；QuickJS-ng 已 vendored 在 `Packages/QuickJS`。
+依赖会由 Swift Package Manager 自动拉取：TDLibKit（含预编译 TDLib，首次拉取较大）、AetherEngine 7.62.0（含预编译 FFmpeg 等框架）；
+QuickJS-ng 已 vendored 在 `Packages/QuickJS`。
+
+## 播放内核（AetherEngine）
+
+- 默认使用 **AetherEngine 7.62.0**（LGPL-3.0，附 App Store / DRM 例外条款），以 SwiftPM 静态链接、未修改。
+- 它带的 **FFmpeg（LGPL-2.1，未启用 GPL / version3 组件）** 及 libzvbi、dav1d、zimg 以**动态框架**形式放在
+  `STV.app/Frameworks/AetherLib*.framework`，没有并入主程序，可以替换 / 重新链接。各组件许可全文见
+  `STV/Resources/Licenses/` 和 App 内「开源许可」，详见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+- AetherEngine 目前**最高只支持 2× 倍速**，倍速列表和长按加速都封顶 2×。
+- CENC 加密片源、FairPlay 或 AetherEngine 加载失败时会**自动回退系统播放器（AVPlayer）**；
+  也可以在「我的 → 片源管理 → 播放设置 → 播放内核」手动选择「AetherEngine / 系统播放器」。
+- **去广告**：同一页的「去广告」开关（默认开启）会在本地 HLS 代理里剔除插播广告片段；不会整段丢弃正片的分段标记。
+  如遇个别片源误删或卡顿，可以关掉试试。
 
 ### 打包未签名 IPA（侧载）
 
@@ -96,7 +117,9 @@ UserDefaults 键 `stv.hg.purePlayerDevice` 写入你自己的 `"<device_id>,<iid
 **iDuanJu** is a native SwiftUI iOS aggregator/player for short dramas, videos, manga and Telegram channels, with a
 sandboxed QuickJS plugin system (per-plugin domain allow-list, isolated cookies/storage, no `eval`). It hosts no content.
 
-- Build: `xcodegen generate`, then build the `STV` scheme in Xcode (iOS 17.0+). Sideload the unsigned IPA from `scripts/package.sh`.
+- Build: `xcodegen generate`, then build the `STV` scheme in Xcode (iOS 18.0+).
+- Player core: AetherEngine 7.62.0 (LGPL-3.0 with App Store exception, unmodified) with FFmpeg (LGPL-2.1) shipped as replaceable
+  dynamic frameworks; automatic AVPlayer fallback; speed capped at 2× by the engine; optional HLS ad-strip (on by default). Sideload the unsigned IPA from `scripts/package.sh`.
 - Telegram login uses **your own** `api_id` / `api_hash` from my.telegram.org; none are bundled.
 - Adult (18+) sources are off by default and require explicit unlock.
 - For personal study only; respect each site's Terms of Service and your local laws.

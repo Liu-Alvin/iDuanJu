@@ -228,7 +228,7 @@ final class LocalHLSProxy: @unchecked Sendable {
             let final = resp.url ?? url
             switch segs[1] {
             case "p.m3u8":
-                let original = String(decoding: d, as: UTF8.self)
+                let original = HLSAdFilter.apply(String(decoding: d, as: UTF8.self), base: final)
                 if let pf = rt.prefetcher, let units = HLSMedia.parse(original, base: final), units.allSatisfy({ $0.range == nil }) {
                     pf.setUnits(units)   // the variant AVPlayer actually chose
                 }

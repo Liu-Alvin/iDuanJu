@@ -223,7 +223,7 @@ struct DanmakuOverlay: View {
     }
 
     private func draw(_ ctx: inout GraphicsContext, _ size: CGSize) {
-        let t = co.player.currentTime().seconds
+        let t = co.playhead
         guard t.isFinite, !placed.isEmpty else { return }
         let dur = settings.speed.duration
         let W = size.width

@@ -1,11 +1,13 @@
+import AetherEngine
 import AVFoundation
 import AVKit
 import MediaPlayer
 import Observation
 import UIKit
 
-/// Drives the vertical episode feed: one shared AVPlayer, per-episode prepared sources,
-/// neighbour preloading, resume and local progress persistence.
+/// Drives the vertical episode feed: one playback core (AetherEngine by default, AVPlayer as the
+/// fallback — see `PlayerEngine`), per-episode prepared sources, neighbour preloading, resume and
+/// local progress persistence.
 @MainActor @Observable
 final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureControllerDelegate {
     /// `.remote`: upstream MP4 played by AVFoundation directly (proxy fallback).
@@ -70,10 +72,15 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     /// Design v3 chrome: rendered video size, tech strip, audio / subtitle options, auto-advance.
     private(set) var videoSize: CGSize = .zero
     private(set) var tech: PlayerTech?
-    private(set) var audioOptions: [AVMediaSelectionOption] = []
-    private(set) var subtitleOptions: [AVMediaSelectionOption] = []
-    private(set) var audioSelected: AVMediaSelectionOption?
-    private(set) var subtitleSelected: AVMediaSelectionOption?
+    private(set) var audioOptions: [MediaTrack] = []
+    private(set) var subtitleOptions: [MediaTrack] = []
+    private(set) var audioSelected: Int?
+    private(set) var subtitleSelected: Int?
+    /// Host-drawn subtitle line (Aether loopback / software routes).
+    private(set) var subtitleText: String?
+    /// Core playing the current episode (the view mounts its surface).
+    private(set) var engineKind: PlayerEngineKind = .avplayer
+    private(set) var muted = false
     var autoNext: Bool = UserDefaults.standard.object(forKey: "stv.player.autoNext") as? Bool ?? true {
         didSet { UserDefaults.standard.set(autoNext, forKey: "stv.player.autoNext") }
     }
@@ -92,11 +99,25 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     @ObservationIgnored private var bypassProxy: Set<Int> = []
     @ObservationIgnored private var lastPrefetchPoll = Date.distantPast
 
-    @ObservationIgnored private(set) lazy var player: AVPlayer = {
-        let player = AVPlayer()
-        player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
-        return player
+    @ObservationIgnored let av: AVPlayerEngine
+    @ObservationIgnored private(set) lazy var aether: AetherPlayerEngine? = {
+        do { return try AetherPlayerEngine() } catch {
+            #if DEBUG
+            NSLog("%@", "[STV] AetherEngine unavailable: \(error)")
+            #endif
+            return nil
+        }
     }()
+    @ObservationIgnored private(set) var engine: PlayerEngine
+    /// Episodes AetherEngine could not open → AVPlayer.
+    @ObservationIgnored private var aetherFailed: Set<Int> = []
+    @ObservationIgnored private var pipIdentity: ObjectIdentifier?
+    @ObservationIgnored private var timer: Timer?
+    @ObservationIgnored private var sharedCommandsRegistered = false
+    /// Aspect fill (view toggle) applied to whichever core is mounted.
+    @ObservationIgnored var fill = false { didSet { engine.fill = fill } }
+    /// Current playhead of the active core (danmaku clock).
+    var playhead: Double { engine.currentTime }
     private var prepared: [Int: Source] = [:]
     private var tasks: [Int: Task<Source, Error>] = [:]
     private var observer: Any?
@@ -119,11 +140,15 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
 
     init(series: HGSeries) {
         self.series = series
+        let a = AVPlayerEngine()
+        self.av = a
+        self.engine = a
         super.init()
     }
 
     func start() {
         guard observer == nil else { return }
+        let player = av.player
         let session = MPNowPlayingSession(players: [player])
         session.automaticallyPublishesNowPlayingInfo = true
         nowPlaying = session
@@ -144,16 +169,39 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
             // PiP controls target AVPlayer directly. System background/interruption pauses must not erase play intent.
             guard note.userInfo?[AVPlayer.rateDidChangeReasonKey] as? String == AVPlayer.RateDidChangeReason.setRateCalled.rawValue else { return }
             MainActor.assumeIsolated {
-                guard let self, self.pipActive, !self.restoringPiP, !self.interrupted, self.readyIndex != nil else { return }
-                self.paused = self.player.rate == 0
+                guard let self, self.engineKind == .avplayer, self.pipActive, !self.restoringPiP, !self.interrupted, self.readyIndex != nil else { return }
+                self.paused = self.av.player.rate == 0
             }
         })
-        statusObservation = player.observe(\.timeControlStatus) { [weak self] player, _ in
-            Task { @MainActor in self?.waitingForMedia = player.timeControlStatus == .waitingToPlayAtSpecifiedRate }
+        // One clock for both cores (AVPlayer periodic observers do not exist on Aether's software route).
+        let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
         }
-        observer = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] t in
-            MainActor.assumeIsolated { self?.tick(t.seconds) }
-        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        observer = t
+        registerSharedCommands()
+    }
+
+    /// Lock-screen / headset commands while Aether plays (AVPlayer's own MPNowPlayingSession covers the fallback).
+    private func registerSharedCommands() {
+        guard !sharedCommandsRegistered else { return }
+        sharedCommandsRegistered = true
+        let c = MPRemoteCommandCenter.shared()
+        c.playCommand.addTarget(self, action: #selector(remotePlay))
+        c.pauseCommand.addTarget(self, action: #selector(remotePause))
+        c.togglePlayPauseCommand.addTarget(self, action: #selector(remoteToggle))
+    }
+
+    private func publishNowPlaying() {
+        guard engineKind == .aether, let i = readyIndex, episodes.indices.contains(i) else { return }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = [
+            MPMediaItemPropertyTitle: detail?.title ?? series.title,
+            MPMediaItemPropertyAlbumTitle: series.source.isLongVideo ? series.source.label : "第\(episodes[i].ep)集",
+            MPMediaItemPropertyPlaybackDuration: duration,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: time,
+            MPNowPlayingInfoPropertyPlaybackRate: paused ? 0.0 : playbackRate,
+        ]
     }
 
     private func activateAudioSession() {
@@ -182,17 +230,24 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         if let commands = nowPlaying?.remoteCommandCenter {
             [commands.playCommand, commands.pauseCommand, commands.togglePlayPauseCommand].forEach { $0.removeTarget(self) }
         }
+        if sharedCommandsRegistered {
+            let c = MPRemoteCommandCenter.shared()
+            [c.playCommand, c.pauseCommand, c.togglePlayPauseCommand].forEach { $0.removeTarget(self) }
+            sharedCommandsRegistered = false
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        }
         nowPlaying = nil
         if pip?.isPictureInPictureActive == true {
             pip?.stopPictureInPicture()
         }
         pip = nil
+        pipIdentity = nil
         pipActive = false
         pipPossible = false
-        player.pause()
-        if let observer { player.removeTimeObserver(observer) }
+        timer?.invalidate(); timer = nil
         observer = nil
-        player.replaceCurrentItem(with: nil)
+        av.stop()
+        aether?.stop()
         readyIndex = nil
         current = nil
         backgrounded = false
@@ -212,9 +267,18 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
 
     // MARK: PiP
 
-    func attachPlayerLayer(_ layer: AVPlayerLayer) {
-        guard AVPictureInPictureController.isPictureInPictureSupported(), pip?.playerLayer !== layer,
-              let controller = AVPictureInPictureController(playerLayer: layer) else { return }
+    /// (Re)build the PiP controller when the active core's picture route changes.
+    private func refreshPiP() {
+        let id = engine.pipIdentity
+        guard id != pipIdentity else { return }
+        guard !pipActive else { return }                 // never swap under a live PiP window
+        pipIdentity = id
+        pipObservation = nil
+        pip?.delegate = nil
+        pip = nil
+        pipPossible = false
+        guard id != nil, AVPictureInPictureController.isPictureInPictureSupported(),
+              let controller = engine.makePiPController() else { return }
         controller.delegate = self
         controller.canStartPictureInPictureAutomaticallyFromInline = true
         pip = controller
@@ -238,6 +302,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
 
     func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {
         pipActive = true
+        engine.setPiPActive(true)
     }
 
     func pictureInPictureController(_ controller: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
@@ -253,8 +318,9 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
 
     func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
         pipActive = false
+        engine.setPiPActive(false)
         if !restoringPiP { setPaused(true) }
-        else if !backgrounded, !paused, !interrupted, readyIndex != nil, player.timeControlStatus == .paused { play() }
+        else if !backgrounded, !paused, !interrupted, readyIndex != nil, engine.isPaused { play() }
         restoringPiP = false
     }
 
@@ -270,7 +336,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
             restoringPiP = true
             pip?.stopPictureInPicture()
         }
-        if !paused, !interrupted, readyIndex != nil, player.timeControlStatus == .paused { play() }
+        if !paused, !interrupted, readyIndex != nil, engine.isPaused { play() }
     }
 
     private func handleInterruption(_ notification: Notification) {
@@ -306,9 +372,9 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
 
     func applyRate(_ rate: Double) {
         let r = Self.nearestStep(rate)
-        playbackRate = r
-        player.defaultRate = Float(r)
-        if !paused, !interrupted, readyIndex != nil { player.rate = Float(r) }
+        let clamped = min(r, engine.maxRate)
+        playbackRate = clamped
+        if !paused, !interrupted, readyIndex != nil { engine.setRate(clamped) }
     }
 
     func lockRate(_ rate: Double) {
@@ -357,8 +423,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         let token = UUID()
         activation = token
         readyIndex = nil
-        itemObservation = nil
-        player.pause()
+        engine.pause()
         time = 0; loadedUntil = 0
         duration = Double(episodes[i].duration)
         for k in tasks.keys where k != i && k != i + 1 {
@@ -381,56 +446,45 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
             do {
                 let src = try await prepare(i)
                 guard activation == token else { return }
-                guard let item = Self.makeItem(src) else { throw URLError(.badURL) }
-                item.nowPlayingInfo = [MPMediaItemPropertyTitle: detail?.title ?? series.title,
-                                       MPMediaItemPropertyAlbumTitle: series.source.isLongVideo ? series.source.label : "第\(episodes[i].ep)集"]
-                player.replaceCurrentItem(with: item)
-                thumbnails.attach(item.asset)
-                tech = nil; videoSize = .zero; audioOptions = []; subtitleOptions = []
-                itemObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-                    Task { @MainActor in
-                        #if DEBUG
-                        if item.status == .readyToPlay { NSLog("%@", "[STV] item readyToPlay") }
-                        #endif
-                        guard let self, self.activation == token, item.status == .failed else { return }
-                        #if DEBUG
-                        let ns = item.error as NSError?
-                        let under = (ns?.userInfo[NSUnderlyingErrorKey] as? NSError).map { "\($0.domain) \($0.code)" } ?? "-"
-                        NSLog("%@", "[STV] item failed \(ns?.domain ?? "-") \(ns?.code ?? 0) under=\(under) url=\((item.asset as? AVURLAsset)?.url.absoluteString.prefix(80) ?? "-") log=\(item.errorLog()?.events.map { "\($0.errorStatusCode) \($0.errorComment ?? "")" } ?? [])")
-                        #endif
-                        self.readyIndex = nil
-                        if Self.canBypassProxy(src, stream: self.chosen[i]), !self.bypassProxy.contains(i) {
-                            // Proxy path failed (probe/CDN/token): retry once with AVFoundation talking to the CDN.
-                            #if DEBUG
-                            NSLog("%@", "[STV] proxy fallback → direct CDN")
-                            #endif
-                            self.bypassProxy.insert(i)
-                            if let tok = self.prefetchTokens.removeValue(forKey: i) { LocalHLSProxy.shared.release(tok) }
-                            self.prepared[i] = nil
-                            self.chosen[i] = nil
-                            self.activate(i)
-                            return
-                        }
-                        self.prepared[i] = nil
-                        self.chosen[i] = nil
-                        self.errors[i] = Self.failureText(item.error)
-                    }
-                }
+                let next = chooseEngine(i, src)
+                switchEngine(to: next)
+                tech = nil; videoSize = .zero; audioOptions = []; subtitleOptions = []; audioSelected = nil; subtitleSelected = nil; subtitleText = nil
+                thumbnails.attach(Self.thumbnailAsset(src, stream: chosen[i]))
+                var start: Double?
                 if let p = LibraryStore.shared.progress(for: series), p.episodeIndex == i, p.seconds > 3,
-                   p.duration <= 0 || p.seconds < p.duration - 5 {
-                    await player.seek(to: CMTime(seconds: p.seconds, preferredTimescale: 600))
+                   p.duration <= 0 || p.seconds < p.duration - 5 { start = p.seconds }
+                let title = detail?.title ?? series.title
+                next.onFailed = { [weak self, weak next] err in
+                    guard let self, let next, self.activation == token, self.engine === next else { return }
+                    self.playbackFailed(i, src: src, engine: next.kind, error: err)
                 }
-                guard activation == token, item.status != .failed else { return }
+                next.onEnded = { [weak self, weak next] in
+                    guard let self, let next, self.activation == token, self.engine === next, self.current == i else { return }
+                    if i + 1 < self.episodes.count, self.autoNext { self.select(i + 1) } else { self.setPaused(true) }
+                }
+                do {
+                    try await next.load(src, stream: chosen[i], start: start, title: title)
+                } catch is CancellationError {
+                    return
+                } catch where next.kind == .aether {
+                    guard activation == token else { return }
+                    playbackFailed(i, src: src, engine: .aether, error: error)
+                    return
+                }
+                guard activation == token else { return }
                 #if DEBUG
-                NSLog("%@", "[STV] item prepared src=\(String(describing: src).prefix(120))")
+                NSLog("%@", "[STV] item prepared engine=\(next.kind.short) src=\(String(describing: src).prefix(120))")
                 #endif
-                observeEnd(item, index: i)
+                next.muted = muted
                 readyIndex = i
+                refreshPiP()
                 if !paused, !interrupted { play() }
                 if episodes.indices.contains(i + 1) {
                     Task { [weak self] in
                         guard let self, self.activation == token else { return }
-                        _ = try? await self.prepare(i + 1)
+                        if let nextSrc = try? await self.prepare(i + 1), self.engineKind == .aether {
+                            await Self.prewarm(nextSrc)
+                        }
                     }
                 }
                 if series.source == .hongguo {
@@ -438,7 +492,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
                     let next = episodes.indices.filter { $0 > i && $0 <= i + 3 }.map { episodes[$0].vid }
                     Task { await HongguoClient.shared.prefetch(vids: next) }
                 }
-                _ = await nowPlaying?.becomeActiveIfPossible()
+                if engineKind == .avplayer { _ = await nowPlaying?.becomeActiveIfPossible() } else { publishNowPlaying() }
             } catch {
                 guard activation == token else { return }
                 errors[i] = error.localizedDescription
@@ -447,15 +501,78 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         }
     }
 
-    private func observeEnd(_ item: AVPlayerItem, index: Int) {
-        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
-        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, self.current == index, self.player.currentItem === item else { return }
-                if index + 1 < self.episodes.count, self.autoNext { self.select(index + 1) }
-                else { self.setPaused(true) }
-            }
+    /// Aether unless the user chose the system player, the source needs AVPlayer (resource-loader AES,
+    /// FairPlay), Aether could not be created, or it already failed on this episode.
+    private func chooseEngine(_ i: Int, _ src: Source) -> PlayerEngine {
+        guard PlayerEngineSettings.preferred == .aether, !aetherFailed.contains(i),
+              let a = aether, a.supports(src) else { return av }
+        return a
+    }
+
+    private func switchEngine(to next: PlayerEngine) {
+        if next !== engine {
+            engine.onFailed = nil; engine.onEnded = nil
+            engine.stop()
+            engine = next
         }
+        engine.fill = fill
+        if engineKind != next.kind { engineKind = next.kind }
+    }
+
+    /// Fallback ladder: Aether → AVPlayer on the same source → AVPlayer straight from the CDN
+    /// (loopback-proxied MP4, fresh resolve) → error with the code.
+    private func playbackFailed(_ i: Int, src: Source, engine kind: PlayerEngineKind, error: Error?) {
+        readyIndex = nil
+        if kind == .aether {
+            #if DEBUG
+            NSLog("%@", "[STV] aether fallback → AVPlayer: \(error?.localizedDescription ?? "-")")
+            #endif
+            aetherFailed.insert(i)
+            activate(i)
+            return
+        }
+        if Self.canBypassProxy(src, stream: chosen[i]), !bypassProxy.contains(i) {
+            #if DEBUG
+            NSLog("%@", "[STV] proxy fallback → direct CDN")
+            #endif
+            bypassProxy.insert(i)
+            if let tok = prefetchTokens.removeValue(forKey: i) { LocalHLSProxy.shared.release(tok) }
+            prepared[i] = nil
+            chosen[i] = nil
+            activate(i)
+            return
+        }
+        prepared[i] = nil
+        chosen[i] = nil
+        errors[i] = Self.failureText(error)
+    }
+
+    /// Scrub thumbnails come from a separate AVURLAsset (any core): files and progressive MP4s only.
+    static func thumbnailAsset(_ src: Source, stream: HGStream?) -> AVAsset? {
+        switch src {
+        case .file(let u): return AVURLAsset(url: u)
+        case .direct(let u):
+            guard u.path.hasSuffix(".mp4") else { return nil }
+            return AVURLAsset(url: u, options: [AVURLAssetOverrideMIMETypeKey: "video/mp4"])
+        case .remote(let u, let h):
+            return AVURLAsset(url: u, options: [AVURLAssetOverrideMIMETypeKey: "video/mp4", "AVURLAssetHTTPHeaderFieldsKey": h])
+        case .stream(let loader, let s):
+            guard let u = URL(string: s), !AetherPlayerEngine.isPlaylist(u) else { return nil }
+            return AVURLAsset(url: u, options: ["AVURLAssetHTTPHeaderFieldsKey": loader.headers])
+        }
+    }
+
+    /// Preload the next episode's opening bytes into Aether (remote progressive sources only).
+    nonisolated static func prewarm(_ src: Source) async {
+        let target: (URL, [String: String])?
+        switch src {
+        case .remote(let u, let h): target = (u, h)
+        case .stream(let loader, let s):
+            if let u = URL(string: s), !AetherPlayerEngine.isPlaylist(u), loader.keyHex.isEmpty { target = (u, loader.headers) } else { target = nil }
+        default: target = nil
+        }
+        guard let (u, h) = target else { return }
+        _ = await AetherEngine.prewarm(url: u, httpHeaders: AetherPlayerEngine.headers(h, for: u))
     }
 
     private func prepare(_ i: Int) async throws -> Source {
@@ -470,6 +587,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         let want = chosen[i]
         let preferredId = SitePrefs.preferredStream[series.id]
         let bypass = bypassProxy.contains(i)
+        let viaAether = PlayerEngineSettings.preferred == .aether && !aetherFailed.contains(i) && aether != nil
         let task = Task<Source, Error> { [weak self] in
             var stream = want
             if stream == nil {
@@ -503,6 +621,13 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
             case .mp4Clear, .hls, .hlsAES:
                 let budget = bypass ? 0 : BufferSettings.budget(for: series.source)
                 if budget > 0, let proxied = await self?.prebuffered(s, budget: budget, index: i) { return proxied }
+                if viaAether, s.kind != .mp4Clear, s.key.isEmpty {
+                    // Aether hands HLS to AVPlayer on a URL: keep our playlist rewriting (ad-strip, headers,
+                    // SupJav fake-PNG) by serving it from the loopback proxy.
+                    if LocalHLSProxy.token(of: s.url) != nil, let u = URL(string: s.url) { return .direct(u) }
+                    if let p = LocalHLSProxy.shared.playlistURL(s.url, headers: s.headers, strip: false, budget: 0),
+                       let u = URL(string: p) { return .direct(u) }
+                }
                 return .stream(HLSPlayback(headers: s.headers, keyHex: s.key), s.url)
             }
         }
@@ -558,50 +683,50 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     private func setPaused(_ value: Bool) {
         paused = value
         if value {
-            player.pause()
+            engine.pause()
             save(force: true)
         } else if !interrupted, readyIndex != nil {
-            if duration > 0, player.currentTime().seconds >= duration - 0.15 { seek(fraction: 0) }
+            if duration > 0, engine.currentTime >= duration - 0.15, engine.kind == .avplayer { seek(fraction: 0) }
             play()
         }
+        publishNowPlaying()
     }
 
     private func play() {
         activateAudioSession()
-        player.defaultRate = Float(playbackRate)
-        player.play()
+        engine.play(rate: min(playbackRate, engine.maxRate))
+    }
+
+    func setMuted(_ on: Bool) {
+        muted = on
+        engine.muted = on
     }
 
     /// ±10 s buttons / double tap.
     func seek(by seconds: Double) {
         guard duration > 0 else { return }
-        let t = max(0, min(duration - 0.5, player.currentTime().seconds + seconds))
+        let t = max(0, min(duration - 0.5, engine.currentTime + seconds))
         seek(fraction: t / duration)
     }
 
-    private func refreshMediaOptions(_ item: AVPlayerItem) async {
-        if let g = try? await item.asset.loadMediaSelectionGroup(for: .audible) {
-            audioOptions = g.options; audioSelected = item.currentMediaSelection.selectedMediaOption(in: g)
-        }
-        if let g = try? await item.asset.loadMediaSelectionGroup(for: .legible) {
-            subtitleOptions = g.options; subtitleSelected = item.currentMediaSelection.selectedMediaOption(in: g)
-        }
+    private func refreshMediaOptions() {
+        let a = engine.audioTracks, st = engine.subtitleTracks
+        if a != audioOptions { audioOptions = a }
+        if st != subtitleOptions { subtitleOptions = st }
+        if engine.selectedAudio != audioSelected { audioSelected = engine.selectedAudio }
+        if engine.selectedSubtitle != subtitleSelected { subtitleSelected = engine.selectedSubtitle }
     }
 
-    /// nil option = subtitles off.
-    func selectMedia(_ option: AVMediaSelectionOption?, audible: Bool) {
-        guard let item = player.currentItem else { return }
-        Task {
-            guard let g = try? await item.asset.loadMediaSelectionGroup(for: audible ? .audible : .legible) else { return }
-            item.select(option, in: g)
-            if audible { audioSelected = option } else { subtitleSelected = option }
-        }
-    }
+    /// Track ids are `MediaTrack.id`; nil subtitle = off.
+    func selectAudio(_ id: Int) { engine.selectAudio(id); audioSelected = id }
+    func selectSubtitle(_ id: Int?) { engine.selectSubtitle(id); subtitleSelected = id }
 
     func seek(fraction: Double) {
         guard duration > 0 else { return }
-        player.seek(to: CMTime(seconds: duration * fraction, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
-        updatePrefetch(at: duration * fraction, force: true)
+        let target = duration * fraction
+        time = target
+        Task { await engine.seek(to: target) }
+        updatePrefetch(at: target, force: true)
     }
 
     /// Follow the playhead (seek restarts prefetch from the new position) and refresh the HUD figure.
@@ -635,24 +760,32 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
         }
     }
 
-    private func tick(_ t: Double) {
-        guard readyIndex != nil, t.isFinite else { return }
+    private func tick() {
+        guard readyIndex != nil else { return }
+        let t = engine.currentTime
+        guard t.isFinite else { return }
         time = t
-        if let d = player.currentItem?.duration.seconds, d.isFinite, d > 0 { duration = d }
-        if let s = player.currentItem?.presentationSize, s.width > 0, s != videoSize { videoSize = s }
-        if Date().timeIntervalSince(lastTech) > 2, let item = player.currentItem, let i = readyIndex {
+        let waiting = engine.isWaiting
+        if waiting != waitingForMedia { waitingForMedia = waiting }
+        let d = engine.duration
+        if d.isFinite, d > 0, abs(d - duration) > 0.01 { duration = d }
+        let s = engine.presentationSize
+        if s.width > 0, s != videoSize { videoSize = s }
+        let sub = engine.subtitleText
+        if sub != subtitleText { subtitleText = sub }
+        loadedUntil = engine.bufferedUntil
+        if Date().timeIntervalSince(lastTech) > 2, let i = readyIndex {
             lastTech = Date()
             let stream = chosen[i]
+            let eng = engine
             Task { [weak self] in
-                let t = await PlayerTech.read(item, stream: stream)
-                guard let self, self.player.currentItem === item else { return }
+                let t = await eng.tech(stream: stream)
+                guard let self, self.engine === eng else { return }
                 if t != self.tech { self.tech = t }
-                await self.refreshMediaOptions(item)
+                self.refreshMediaOptions()
+                self.refreshPiP()
+                self.publishNowPlaying()
             }
-        }
-        if let ranges = player.currentItem?.loadedTimeRanges.map(\.timeRangeValue) {
-            let r = ranges.first { $0.start.seconds <= t + 1 && ($0.start + $0.duration).seconds >= t } ?? ranges.first
-            loadedUntil = r.map { ($0.start + $0.duration).seconds } ?? 0
         }
         updatePrefetch(at: t)
         save(force: false)
@@ -661,7 +794,7 @@ final class PlaybackCoordinator: NSObject, @preconcurrency AVPictureInPictureCon
     private func save(force: Bool) {
         guard let i = readyIndex, episodes.indices.contains(i) else { return }
         guard force || Date().timeIntervalSince(lastSave) > 4 else { return }
-        let seconds = force ? player.currentTime().seconds : time
+        let seconds = force ? engine.currentTime : time
         guard seconds.isFinite, seconds > 0 else { return }
         lastSave = Date()
         // Deep links / season switches may carry a bare series; fill title & cover from the loaded detail.

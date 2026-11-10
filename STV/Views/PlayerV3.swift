@@ -51,6 +51,10 @@ struct PlayerTechStrip: View {
             }
             if tech.fps > 0 { pair("FPS", "\(tech.fps)", fs) }
             if landscape, tech.bitrate > 0 { pair("BPS", String(format: "%.1f", tech.bitrate), fs) }
+            if !tech.engine.isEmpty {
+                Text(tech.engine).font(.system(size: fs - 1.5, weight: .semibold)).opacity(0.7)
+                    .accessibilityIdentifier("player.engine")
+            }
             if tech.network > 0 {
                 HStack(spacing: 3) {
                     Image(systemName: "wifi").font(.system(size: fs, weight: .semibold))
@@ -265,13 +269,15 @@ struct PlayerSectionTitle: View {
 struct SpeedPopover: View {
     let current: Double
     var landscape = false
+    /// Active core's ceiling (AetherEngine clamps video to 2×; AVPlayer 3×).
+    var maxRate: Double = 3
     let onPick: (Double) -> Void
     static let portraitSteps: [Double] = [0.5, 0.75, 1, 1.25, 1.5, 2, 3]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             if !landscape { PlayerSectionTitle(text: "播放速度") }
-            ForEach(landscape ? Array(Self.portraitSteps.prefix(6)) : Self.portraitSteps, id: \.self) { r in
+            ForEach((landscape ? Array(Self.portraitSteps.prefix(6)) : Self.portraitSteps).filter { $0 <= maxRate + 0.001 }, id: \.self) { r in
                 PlayerPopoverRow(title: Self.label(r), selected: abs(r - current) < 0.01, id: "player.rate.\(r)", rowHeight: landscape ? 37 : 44) { onPick(r) }
             }
             if !landscape {
@@ -324,11 +330,12 @@ struct QualityPopover: View {
 
 struct TrackPopover: View {
     let title: String
-    let options: [AVMediaSelectionOption]
-    let selected: AVMediaSelectionOption?
+    let options: [MediaTrack]
+    let selected: Int?
     let allowsOff: Bool
     let emptyText: String
-    let onPick: (AVMediaSelectionOption?) -> Void
+    /// Track id; nil = off.
+    let onPick: (Int?) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
@@ -337,8 +344,8 @@ struct TrackPopover: View {
                 Text(emptyText).font(.system(size: 14)).foregroundStyle(.white.opacity(0.7)).padding(.horizontal, 12).frame(minHeight: 44)
             } else {
                 if allowsOff { PlayerPopoverRow(title: "关闭", selected: selected == nil) { onPick(nil) } }
-                ForEach(options, id: \.self) { o in
-                    PlayerPopoverRow(title: o.displayName, selected: o == selected) { onPick(o) }
+                ForEach(options) { o in
+                    PlayerPopoverRow(title: o.title, selected: o.id == selected) { onPick(o.id) }
                 }
             }
         }

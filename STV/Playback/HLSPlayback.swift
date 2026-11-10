@@ -7,8 +7,8 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
     static let plScheme = "stvhls"
     static let keyScheme = "stvkey"
 
-    private let headers: [String: String]
-    private let keyHex: String
+    let headers: [String: String]
+    let keyHex: String
     private let queue = DispatchQueue(label: "stv.hls.loader")
     private let session = URLSession(configuration: .default)
 
@@ -47,7 +47,7 @@ final class HLSPlayback: NSObject, AVAssetResourceLoaderDelegate {
             guard let self, let data, err == nil, (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? false else {
                 req.finishLoading(with: err ?? URLError(.badServerResponse)); return
             }
-            let text = self.rewrite(String(decoding: data, as: UTF8.self), base: real)
+            let text = self.rewrite(HLSAdFilter.apply(String(decoding: data, as: UTF8.self), base: real), base: real)
             req.contentInformationRequest?.contentType = "public.m3u-playlist"
             req.contentInformationRequest?.contentLength = Int64(text.utf8.count)
             req.dataRequest?.respond(with: Data(text.utf8))
